@@ -1,0 +1,51 @@
+name: oc-mcp
+
+services:
+  bridge:
+    image: ${OC_MCP_IMAGE:-ghcr.io/zizazar/oc-mcp:latest}
+    ports:
+      - "127.0.0.1:8765:8765"
+    restart: unless-stopped
+    volumes:
+      - state:/var/lib/oc-mcp
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=2).close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  relay:
+    profiles: [https]
+    image: ${OC_MCP_IMAGE:-ghcr.io/zizazar/oc-mcp:latest}
+    command: ["python", "relay.py", "serve", "--host", "0.0.0.0", "--bridge-host", "bridge", "--public-url", "https://${OC_MCP_DOMAIN:-localhost}"]
+    depends_on:
+      bridge:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - state:/var/lib/oc-mcp:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/', timeout=2).close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  caddy:
+    profiles: [https]
+    image: caddy:2-alpine
+    command: ["caddy", "reverse-proxy", "--from", "https://${OC_MCP_DOMAIN:-localhost}", "--to", "relay:8766"]
+    depends_on:
+      relay:
+        condition: service_healthy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  state:
+  caddy-data:
+  caddy-config:

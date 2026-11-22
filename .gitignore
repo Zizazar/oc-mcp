@@ -1,0 +1,4 @@
+.oc-mcp-key
+__pycache__/
+.venv/
+.env

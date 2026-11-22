@@ -17,11 +17,13 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Route
 
-from bridge import FRAME_LIMIT, HOST, NAME, ROOT, access_key, installer_command, installer_script, token, valid_token
+from bridge import FRAME_LIMIT, HOST, NAME, ROOT, access_key, installer_command, installer_script, mcp_path, token, valid_token
 
 
 QUICK_URL = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 RELAY_STATUS = "OpenComputers relay\n"
+MCP_REQUEST_HEADERS = ("accept", "content-type", "mcp-protocol-version", "mcp-session-id", "last-event-id", "origin")
+MCP_RESPONSE_HEADERS = ("allow", "content-type", "mcp-session-id")
 
 
 def https_origin(value: str) -> str:
@@ -33,10 +35,15 @@ def https_origin(value: str) -> str:
     return value
 
 
+def mcp_bearer_token(key: bytes) -> str:
+    return token(key, "mcp/bearer", 64)
+
+
 class Relay:
     def __init__(self, key: bytes, bridge_port: int, bridge_host: str = HOST):
         self.key = key
         self.bridge_url = f"http://{bridge_host}:{bridge_port}"
+        self.bridge_host_header = f"{HOST}:{bridge_port}"
         self.url: str | None = None
         self.agent = (ROOT / "oc-mcp.lua").read_text(encoding="utf-8")
 
@@ -50,6 +57,27 @@ class Relay:
         if self.url is None:
             return PlainTextResponse("Relay is not connected", status_code=503)
         return PlainTextResponse(RELAY_STATUS + self.url, headers={"Cache-Control": "no-store"})
+
+    async def mcp(self, request: Request) -> Response:
+        scheme, _, credential = request.headers.get("authorization", "").partition(" ")
+        if scheme.lower() != "bearer" or not valid_token(credential.lstrip(" "), mcp_bearer_token(self.key)):
+            return PlainTextResponse("Bearer token required", status_code=401,
+                                     headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"})
+
+        headers = {name: request.headers[name] for name in MCP_REQUEST_HEADERS if name in request.headers}
+        # The bridge applies its existing loopback Host and Origin checks.
+        headers["host"] = self.bridge_host_header
+        try:
+            response = await request.app.state.client.request(
+                request.method, self.bridge_url + mcp_path(self.key), headers=headers,
+                content=request.stream() if request.method == "POST" else None,
+                timeout=60,  # A bridge tool call can wait up to 52 seconds.
+            )
+        except httpx.RequestError:
+            return PlainTextResponse("Local bridge unavailable", status_code=503)
+        headers = {name: response.headers[name] for name in MCP_RESPONSE_HEADERS if name in response.headers}
+        headers["cache-control"] = "no-store"
+        return Response(response.content, status_code=response.status_code, headers=headers)
 
     async def install(self, request: Request) -> Response:
         url, name = self.url, request.path_params["name"]
@@ -109,7 +137,7 @@ async def watch_tunnel(process: asyncio.subprocess.Process, relay: Relay) -> Non
     print("Quick Tunnel stopped. Restart the relay to get a new HTTPS address.", flush=True)
 
 
-def create_relay_app(relay: Relay, relay_port: int, public_url: str | None, cloudflared: str | None):
+def create_relay_app(relay: Relay, relay_port: int, public_url: str | None, cloudflared: str | None, *, expose_mcp: bool = False):
     @asynccontextmanager
     async def lifespan(app: Starlette):
         process = watcher = None
@@ -146,11 +174,14 @@ def create_relay_app(relay: Relay, relay_port: int, public_url: str | None, clou
                             process.kill()
                         await process.communicate()
 
-    return Starlette(lifespan=lifespan, routes=[
+    routes = [
         Route("/", relay.status, methods=["GET"]),
         Route("/i/{name}/{token}", relay.install, methods=["GET"]),
         Route("/a/{name}/{token}", relay.poll, methods=["POST"]),
-    ])
+    ]
+    if expose_mcp:
+        routes.append(Route("/mcp", relay.mcp, methods=["GET", "POST", "DELETE"]))
+    return Starlette(lifespan=lifespan, routes=routes)
 
 
 def current_url(relay_port: int) -> str:
@@ -170,14 +201,19 @@ def main() -> None:
     parser.add_argument("--bridge-port", type=int, default=8765, help="bridge port (default 8765)")
     actions = parser.add_subparsers(dest="action", required=True)
     serve = actions.add_parser("serve", help="start a Cloudflare Quick Tunnel and the agent gateway")
-    serve.add_argument("--public-url", help="use an existing HTTPS tunnel to this relay instead of starting cloudflared")
+    serve.add_argument("--public-url", help="use the relay's existing public HTTPS address instead of starting cloudflared")
     serve.add_argument("--host", default=HOST, help="address to bind (default 127.0.0.1)")
     serve.add_argument("--bridge-host", default=HOST, help="address of the bridge (default 127.0.0.1)")
+    serve.add_argument("--expose-mcp", action="store_true", help="serve /mcp with bearer-token authentication")
+    actions.add_parser("mcp-token", help="print the bearer token for the public MCP endpoint")
     install = actions.add_parser("install", help="print the one-line OpenOS installer for the active tunnel")
     install.add_argument("name")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535 or not 1 <= args.bridge_port <= 65535 or args.port == args.bridge_port:
         parser.error("the relay and bridge need different ports between 1 and 65535")
+    if args.action == "mcp-token":
+        print(mcp_bearer_token(access_key()))
+        return
     if args.action == "install":
         if not NAME.fullmatch(args.name):
             parser.error("use a name like server-main (a-z, 0-9, _, -, up to 24 characters)")
@@ -197,7 +233,7 @@ def main() -> None:
         if cloudflared is None:
             parser.error("cloudflared was not found in PATH. Install it from https://developers.cloudflare.com/tunnel/downloads/")
     relay = Relay(access_key(), args.bridge_port, args.bridge_host)
-    app = create_relay_app(relay, args.port, public_url, cloudflared)
+    app = create_relay_app(relay, args.port, public_url, cloudflared, expose_mcp=args.expose_mcp)
     config = uvicorn.Config(app, host=args.host, port=args.port, access_log=False, proxy_headers=False)
     server = uvicorn.Server(config)
     try:

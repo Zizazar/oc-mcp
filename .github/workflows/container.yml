@@ -46,9 +46,17 @@ jobs:
           docker compose --profile https up --detach --wait --wait-timeout 60
           curl --fail --silent --show-error --retry 5 --retry-all-errors --insecure https://localhost/ >/dev/null
           mcp_url=$(docker compose exec -T bridge python bridge.py mcp-url)
-          curl --fail --silent --show-error "$mcp_url" \
-            -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
-            --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"container-check","version":"1"}}}' \
+          public_mcp_url=https://localhost/mcp
+          mcp_token=$(docker compose --profile https exec -T relay python relay.py mcp-token)
+          echo "::add-mask::$mcp_token"
+          initialize='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"container-check","version":"1"}}}'
+          headers=(-H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream')
+          curl --fail --silent --show-error "$mcp_url" "${headers[@]}" --data "$initialize" \
+            | jq -e '.result.serverInfo.name == "OpenComputers"'
+          test "$(curl --silent --show-error --insecure -o /dev/null -w '%{http_code}' "$public_mcp_url" "${headers[@]}" --data "$initialize")" = 401
+          test "$(curl --silent --show-error --insecure -o /dev/null -w '%{http_code}' "$public_mcp_url" "${headers[@]}" --data "$initialize" -H 'Authorization: Bearer invalid')" = 401
+          curl --fail --silent --show-error --insecure "$public_mcp_url" "${headers[@]}" --data "$initialize" \
+            -H "Authorization: Bearer $mcp_token" \
             | jq -e '.result.serverInfo.name == "OpenComputers"'
           installer=$(docker compose exec -T relay python relay.py install container-check)
           read -r _ _ installer_url _ <<< "$installer"
@@ -57,6 +65,7 @@ jobs:
           test "$(curl --silent --show-error --insecure -o /dev/null -w '%{http_code}' "https://localhost/mcp/${mcp_url##*/}")" = 404
           docker compose --profile https up --detach --wait --wait-timeout 60 --force-recreate
           test "$(docker compose exec -T bridge python bridge.py mcp-url)" = "$mcp_url"
+          test "$(docker compose --profile https exec -T relay python relay.py mcp-token)" = "$mcp_token"
 
       - name: Stop smoke test containers
         if: always()

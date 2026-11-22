@@ -18,13 +18,19 @@ docker compose --profile https exec -T relay python relay.py install server-main
 
 Подставьте имя своего HTTPS entrypoint и resolver для сертификатов. Если Traefik уже подбирает сертификат по домену, оставьте `TRAEFIK_CERTRESOLVER` пустым. Переменные можно сохранить в `.env` вместо `export`. Выполните выведенную команду в терминале игрового компьютера с OpenOS и Internet Card. Для каждого компьютера задайте своё имя.
 
-Для подключения Codex запустите SSH-туннель с компьютера, где работает Codex. Он перенаправляет порт `8765` на мост, опубликованный на локальном интерфейсе VPS.
+Codex подключается напрямую к `https://oc.example.com/mcp` с Bearer-токеном. На VPS получите токен для своего сервера. При обновлениях токен остаётся тем же, пока используется том `oc-mcp_state`.
 
 ```bash
-ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8765:127.0.0.1:8765 user@your-vps
+docker compose --profile https exec -T relay python relay.py mcp-token
 ```
 
-На VPS выполните `docker compose exec -T bridge python bridge.py mcp-url`. Пока SSH-туннель открыт, добавьте выведенный URL командой `codex mcp add opencomputers --url <полученный-URL>` на компьютере с Codex. Держите URL и команды установки у себя.
+На компьютере с Codex подставьте свой домен, введите токен в PowerShell 7 и зарегистрируйте сервер. Перезапустите приложение Codex после настройки.
+
+```powershell
+$env:OC_MCP_TOKEN = Read-Host 'MCP token' -MaskInput
+[Environment]::SetEnvironmentVariable('OC_MCP_TOKEN', $env:OC_MCP_TOKEN, 'User')
+codex mcp add opencomputers --url https://oc.example.com/mcp --bearer-token-env-var OC_MCP_TOKEN
+```
 
 Для обновления с теми же переменными запустите на VPS `docker compose --profile https up -d --pull always --wait`. Если в репозитории изменился `compose.yaml`, скачайте его заново. Сохраняйте том `oc-mcp_state` при резервном копировании и удалении контейнеров.
 

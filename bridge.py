@@ -76,6 +76,10 @@ def token(key: bytes, purpose: str, length: int = 32) -> str:
     return hmac.digest(key, purpose.encode(), "sha256").hex()[:length]
 
 
+def mcp_path(key: bytes) -> str:
+    return f"/mcp/{token(key, 'mcp', 64)}"
+
+
 def valid_token(value: str, expected: str) -> bool:
     return value.isascii() and hmac.compare_digest(value, expected)
 
@@ -119,7 +123,7 @@ class Bridge:
     def __init__(self, key: bytes, port: int):
         self.key = key
         self.url = f"http://{HOST}:{port}"
-        self.mcp_path = f"/mcp/{token(key, 'mcp', 64)}"
+        self.mcp_path = mcp_path(key)
         self.computers: dict[str, Computer] = {}
         self.agent = (ROOT / "oc-mcp.lua").read_text(encoding="utf-8")
 

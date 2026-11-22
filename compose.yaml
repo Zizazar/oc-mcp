@@ -19,7 +19,7 @@ services:
   relay:
     profiles: [https]
     image: ${OC_MCP_IMAGE:-ghcr.io/zizazar/oc-mcp:latest}
-    command: ["python", "relay.py", "serve", "--host", "0.0.0.0", "--bridge-host", "bridge", "--public-url", "https://${OC_MCP_DOMAIN:-oc.example.com}"]
+    command: ["python", "relay.py", "serve", "--host", "0.0.0.0", "--bridge-host", "bridge", "--public-url", "https://${OC_MCP_DOMAIN:-oc.example.com}", "--expose-mcp"]
     networks: [default, proxy]
     labels:
       traefik.enable: "true"

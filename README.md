@@ -2,27 +2,21 @@
 
 Мост для **Minecraft 1.7.10** и OpenOS. Lua-агент проверен с runtime и библиотекой ввода-вывода из OpenComputers 1.8.10. Один MCP-сервер обслуживает все игровые компьютеры в локальном мире. На каждом нужен диск с установленной OpenOS, Internet Card и одна команда установки.
 
-## Свой сервер в Docker
+## Свой сервер в Docker с Traefik
 
 GitHub Actions проверяет и публикует образ `ghcr.io/zizazar/oc-mcp:latest` для Linux x86-64 после каждого обновления `main`. Сервер скачивает готовый образ. Ключ моста хранится в томе `oc-mcp_state`, поэтому адреса подключения сохраняются при обновлениях и перезапусках.
 
-На VPS с Docker и плагином Compose один раз клонируйте приватный репозиторий с доступом на чтение и войдите в GHCR. Для скачивания приватного образа используйте GitHub personal access token (classic) с `read:packages`. [Вход в GitHub Container Registry](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#authenticating-to-the-container-registry)
+На VPS достаточно одного `compose.yaml`. Направьте DNS-запись поддомена на сервер с Traefik. Traefik должен использовать Docker provider и быть подключён к сети, указанной в `TRAEFIK_NETWORK`. [Traefik Docker provider](https://doc.traefik.io/traefik/providers/docker/)
 
 ```bash
-git clone https://github.com/Zizazar/oc-mcp.git
-cd oc-mcp
-docker login ghcr.io -u Zizazar
-```
-
-Направьте DNS-запись домена на VPS и откройте входящие TCP-порты 80 и 443. В `OC_MCP_DOMAIN` укажите только домен. Compose запустит Caddy, который выпустит и будет обновлять TLS-сертификат. Снаружи по HTTPS доступны установщик и API для игровых компьютеров. [Требования Caddy к HTTPS](https://caddyserver.com/docs/automatic-https#overview)
-
-```bash
-printf 'OC_MCP_DOMAIN=oc.example.com\n' > .env
+curl -fsSLo compose.yaml https://raw.githubusercontent.com/Zizazar/oc-mcp/main/compose.yaml
+export OC_MCP_DOMAIN=oc.example.com TRAEFIK_NETWORK=traefik
+export TRAEFIK_HTTPS_ENTRYPOINT=websecure TRAEFIK_CERTRESOLVER=letsencrypt
 docker compose --profile https up -d --pull always --wait
-docker compose exec -T relay python relay.py install server-main
+docker compose --profile https exec -T relay python relay.py install server-main
 ```
 
-Выполните выведенную команду в терминале игрового компьютера с OpenOS и Internet Card. Для каждого компьютера задайте своё имя.
+Подставьте имя своего HTTPS entrypoint и resolver для сертификатов. Если Traefik уже подбирает сертификат по домену, оставьте `TRAEFIK_CERTRESOLVER` пустым. Переменные можно сохранить в `.env` вместо `export`. Выполните выведенную команду в терминале игрового компьютера с OpenOS и Internet Card. Для каждого компьютера задайте своё имя.
 
 Для подключения Codex запустите SSH-туннель с компьютера, где работает Codex. Он перенаправляет порт `8765` на мост, опубликованный на локальном интерфейсе VPS.
 
@@ -32,7 +26,7 @@ ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8765:127.0.0.1:8765 user@your-vp
 
 На VPS выполните `docker compose exec -T bridge python bridge.py mcp-url`. Пока SSH-туннель открыт, добавьте выведенный URL командой `codex mcp add opencomputers --url <полученный-URL>` на компьютере с Codex. Держите URL и команды установки у себя.
 
-Для обновления запустите на VPS `docker compose --profile https up -d --pull always --wait`. Когда в репозитории меняется `compose.yaml`, перед этим выполните `git pull --ff-only`. Сохраняйте том `oc-mcp_state` при резервном копировании и удалении контейнеров.
+Для обновления с теми же переменными запустите на VPS `docker compose --profile https up -d --pull always --wait`. Если в репозитории изменился `compose.yaml`, скачайте его заново. Сохраняйте том `oc-mcp_state` при резервном копировании и удалении контейнеров.
 
 Для локального Docker без HTTPS запустите `docker compose up -d --pull always --wait` из той же папки. Адрес для Codex выдаёт `docker compose exec -T bridge python bridge.py mcp-url`, а команду установки для локального мира выдаёт `docker compose exec -T bridge python bridge.py install main`.
 

@@ -18,6 +18,10 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      OC_MCP_IMAGE: oc-mcp:ci
+      OC_MCP_DOMAIN: localhost
+      TRAEFIK_NETWORK: oc-mcp-ci-proxy
     steps:
       - uses: actions/checkout@v6
         with:
@@ -29,10 +33,15 @@ jobs:
             --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" .
 
+      - name: Start test Traefik
+        run: |
+          docker network create "$TRAEFIK_NETWORK"
+          docker run -d --name oc-mcp-ci-traefik --network "$TRAEFIK_NETWORK" \
+            --publish 127.0.0.1:443:443 --volume /var/run/docker.sock:/var/run/docker.sock:ro \
+            traefik:v3 --providers.docker --providers.docker.exposedbydefault=false \
+            --entrypoints.websecure.address=:443
+
       - name: Check bridge, relay and HTTPS
-        env:
-          OC_MCP_IMAGE: oc-mcp:ci
-          OC_MCP_DOMAIN: localhost
         run: |
           docker compose --profile https up --detach --wait --wait-timeout 60
           curl --fail --silent --show-error --retry 5 --retry-all-errors --insecure https://localhost/ >/dev/null
@@ -51,7 +60,10 @@ jobs:
 
       - name: Stop smoke test containers
         if: always()
-        run: docker compose --profile https down --volumes
+        run: |
+          docker compose --profile https down --volumes
+          docker rm -f oc-mcp-ci-traefik || true
+          docker network rm "$TRAEFIK_NETWORK" || true
 
       - name: Publish to GitHub Container Registry
         env:

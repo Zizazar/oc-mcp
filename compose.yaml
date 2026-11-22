@@ -3,6 +3,8 @@ name: oc-mcp
 services:
   bridge:
     image: ${OC_MCP_IMAGE:-ghcr.io/zizazar/oc-mcp:latest}
+    labels:
+      traefik.enable: "false"
     ports:
       - "127.0.0.1:8765:8765"
     restart: unless-stopped
@@ -17,7 +19,17 @@ services:
   relay:
     profiles: [https]
     image: ${OC_MCP_IMAGE:-ghcr.io/zizazar/oc-mcp:latest}
-    command: ["python", "relay.py", "serve", "--host", "0.0.0.0", "--bridge-host", "bridge", "--public-url", "https://${OC_MCP_DOMAIN:-localhost}"]
+    command: ["python", "relay.py", "serve", "--host", "0.0.0.0", "--bridge-host", "bridge", "--public-url", "https://${OC_MCP_DOMAIN:-oc.example.com}"]
+    networks: [default, proxy]
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: "${TRAEFIK_NETWORK:-traefik}"
+      traefik.http.routers.oc-mcp.rule: "Host(`${OC_MCP_DOMAIN:-oc.example.com}`)"
+      traefik.http.routers.oc-mcp.entrypoints: "${TRAEFIK_HTTPS_ENTRYPOINT:-websecure}"
+      traefik.http.routers.oc-mcp.tls: "true"
+      traefik.http.routers.oc-mcp.tls.certresolver: "${TRAEFIK_CERTRESOLVER:-}"
+      traefik.http.routers.oc-mcp.service: "oc-mcp"
+      traefik.http.services.oc-mcp.loadbalancer.server.port: "8766"
     depends_on:
       bridge:
         condition: service_healthy
@@ -30,22 +42,10 @@ services:
       timeout: 3s
       retries: 5
 
-  caddy:
-    profiles: [https]
-    image: caddy:2-alpine
-    command: ["caddy", "reverse-proxy", "--from", "https://${OC_MCP_DOMAIN:-localhost}", "--to", "relay:8766"]
-    depends_on:
-      relay:
-        condition: service_healthy
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - caddy-data:/data
-      - caddy-config:/config
+networks:
+  proxy:
+    name: ${TRAEFIK_NETWORK:-traefik}
+    external: true
 
 volumes:
   state:
-  caddy-data:
-  caddy-config:

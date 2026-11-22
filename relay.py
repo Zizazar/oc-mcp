@@ -17,9 +17,10 @@ from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Route
 
 from bridge import (
-    FRAME_LIMIT, HOST, NAME, ROOT, access_key, https_origin, installer_command, installer_script,
-    mcp_bearer_token, mcp_path, public_agent_token, token, valid_token,
+    FRAME_LIMIT, HOST, ROOT, McpTokenVerifier, access_key, https_origin, installer_script, mcp_bearer_token, mcp_path,
 )
+from credentials import NAME, agent_path, installer_command, valid_agent_request
+from setup_web import SetupPage
 
 
 QUICK_URL = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
@@ -34,13 +35,11 @@ class Relay:
         self.bridge_url = f"http://{bridge_host}:{bridge_port}"
         self.bridge_host_header = f"{HOST}:{bridge_port}"
         self.url: str | None = None
+        self.verifier = McpTokenVerifier(key)
         self.agent = (ROOT / "oc-mcp.lua").read_text(encoding="utf-8")
 
-    def credential(self, url: str, purpose: str, name: str) -> str:
-        return public_agent_token(self.key, url, purpose, name)
-
     def command(self, url: str, name: str) -> str:
-        return installer_command(f"{url}/i/{name}/{self.credential(url, 'install', name)}")
+        return installer_command(url + agent_path(self.key, url, "install", name))
 
     async def status(self, request: Request) -> Response:
         if self.url is None:
@@ -48,14 +47,16 @@ class Relay:
         return PlainTextResponse(RELAY_STATUS + self.url, headers={"Cache-Control": "no-store"})
 
     async def mcp(self, request: Request) -> Response:
-        scheme, _, credential = request.headers.get("authorization", "").partition(" ")
-        if scheme.lower() != "bearer" or not valid_token(credential.lstrip(" "), mcp_bearer_token(self.key)):
+        authorization = request.headers.get("authorization", "")
+        scheme, _, credential = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not await self.verifier.verify_token(credential):
             return PlainTextResponse("Bearer token required", status_code=401,
                                      headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"})
 
         headers = {name: request.headers[name] for name in MCP_REQUEST_HEADERS if name in request.headers}
         # The bridge applies its existing loopback Host and Origin checks.
         headers["host"] = self.bridge_host_header
+        headers["authorization"] = authorization
         try:
             response = await request.app.state.client.request(
                 request.method, self.bridge_url + mcp_path(self.key), headers=headers,
@@ -70,21 +71,23 @@ class Relay:
 
     async def install(self, request: Request) -> Response:
         url, name = self.url, request.path_params["name"]
-        if not url or not NAME.fullmatch(name) or not valid_token(request.path_params["token"], self.credential(url, "install", name)):
+        account = request.path_params.get("account")
+        if not url or not valid_agent_request(self.key, url, "install", name, account, request.path_params["token"]):
             return PlainTextResponse("Installer not found", status_code=404)
-        endpoint = f"{url}/a/{name}/{self.credential(url, 'agent', name)}"
+        endpoint = url + agent_path(self.key, url, "agent", name, account)
         return PlainTextResponse(installer_script(self.agent, endpoint, name, idle_delay=2), headers={"Cache-Control": "no-store"})
 
     async def poll(self, request: Request) -> Response:
         url, name = self.url, request.path_params["name"]
-        if not url or not NAME.fullmatch(name) or not valid_token(request.path_params["token"], self.credential(url, "agent", name)):
+        account = request.path_params.get("account")
+        if not url or not valid_agent_request(self.key, url, "agent", name, account, request.path_params["token"]):
             return PlainTextResponse("Unknown agent", status_code=404)
         frame = bytearray()
         async for chunk in request.stream():
             if len(frame) + len(chunk) > FRAME_LIMIT:
                 return PlainTextResponse("Frame too large", status_code=413)
             frame.extend(chunk)
-        endpoint = f"{self.bridge_url}/a/{name}/{token(self.key, 'agent/' + name)}"
+        endpoint = self.bridge_url + agent_path(self.key, None, "agent", name, account)
         try:
             response = await request.app.state.client.post(endpoint, content=bytes(frame))
         except httpx.RequestError:
@@ -163,10 +166,20 @@ def create_relay_app(relay: Relay, relay_port: int, public_url: str | None, clou
                             process.kill()
                         await process.communicate()
 
+    setup = SetupPage(relay.key, lambda: relay.url, expose_mcp=expose_mcp)
+
+    async def home(request: Request) -> Response:
+        if "text/html" in request.headers.get("accept", ""):
+            return await setup.handle(request)
+        return await relay.status(request)
+
     routes = [
-        Route("/", relay.status, methods=["GET"]),
+        Route("/", home, methods=["GET"]),
+        Route("/setup", setup.handle, methods=["GET", "POST"]),
         Route("/i/{name}/{token}", relay.install, methods=["GET"]),
         Route("/a/{name}/{token}", relay.poll, methods=["POST"]),
+        Route("/u/{account}/i/{name}/{token}", relay.install, methods=["GET"]),
+        Route("/u/{account}/a/{name}/{token}", relay.poll, methods=["POST"]),
     ]
     if expose_mcp:
         routes.append(Route("/mcp", relay.mcp, methods=["GET", "POST", "DELETE"]))

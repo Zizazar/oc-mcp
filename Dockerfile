@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN python -m pip install --no-cache-dir -r requirements.txt \
     && install -d -m 0700 -o 10001 -g 10001 "$OC_MCP_STATE_DIR"
-COPY bridge.py relay.py oc-mcp.lua ./
+COPY bridge.py relay.py credentials.py setup_web.py setup.html oc-mcp.lua ./
 
 USER 10001:10001
 CMD ["python", "bridge.py", "serve", "--host", "0.0.0.0"]

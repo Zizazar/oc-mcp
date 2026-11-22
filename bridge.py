@@ -3,7 +3,6 @@
 import argparse
 import asyncio
 import base64
-import hmac
 import os
 import re
 import secrets
@@ -15,23 +14,29 @@ from typing import Annotated, Any, Literal
 from urllib.parse import quote_from_bytes, unquote_to_bytes, urlsplit
 
 import uvicorn
+from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import AnyHttpUrl, Field
+from starlette.datastructures import Headers
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+from credentials import NAME, agent_path, installer_command, token, valid_agent_request, valid_token, verify_account_token
+from setup_web import SetupPage
 
 
 ROOT = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
-NAME = re.compile(r"[a-z][a-z0-9_-]{0,23}")
 ADDRESS = re.compile(rb"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 FILE_LIMIT = 16_384
 FRAME_LIMIT = 131_072
 POLL_SECONDS = 0.7
 ONLINE_SECONDS = 12
+OWNER_CLIENT = "oc-mcp"
 FilePath = Annotated[str, Field(min_length=1, max_length=512)]
 Key = Literal["enter", "tab", "backspace", "delete", "escape", "up", "down", "left", "right", "home", "end", "ctrl+c"]
 
@@ -74,21 +79,12 @@ def access_key() -> bytes:
     return key
 
 
-def token(key: bytes, purpose: str, length: int = 32) -> str:
-    return hmac.digest(key, purpose.encode(), "sha256").hex()[:length]
-
-
 def mcp_path(key: bytes) -> str:
     return f"/mcp/{token(key, 'mcp', 64)}"
 
 
 def mcp_bearer_token(key: bytes) -> str:
     return token(key, "mcp/bearer", 64)
-
-
-def public_agent_token(key: bytes, url: str, purpose: str, name: str) -> str:
-    # Keep existing relay installer and agent URLs usable on the same domain.
-    return token(key, f"relay/{url}/{purpose}/{name}")
 
 
 def https_origin(value: str) -> str:
@@ -100,22 +96,36 @@ def https_origin(value: str) -> str:
     return value
 
 
-def valid_token(value: str, expected: str) -> bool:
-    return value.isascii() and hmac.compare_digest(value, expected)
-
-
 class McpTokenVerifier:
     def __init__(self, key: bytes):
+        self.key = key
         self.expected = mcp_bearer_token(key)
 
     async def verify_token(self, token: str) -> AccessToken | None:
-        if valid_token(token.lstrip(" "), self.expected):
-            return AccessToken(token=self.expected, client_id="oc-mcp", scopes=[])
+        credential = token.lstrip(" ")
+        if valid_token(credential, self.expected):
+            return AccessToken(token=credential, client_id=OWNER_CLIENT, scopes=[])
+        if account := verify_account_token(self.key, credential):
+            return AccessToken(token=credential, client_id=account, scopes=[])
         return None
 
 
-def installer_command(url: str) -> str:
-    return f"wget -f {url} /tmp/oc-mcp.lua && /tmp/oc-mcp.lua install"
+class LocalMcpAuth:
+    def __init__(self, app: ASGIApp, path: str, owner_token: str):
+        self.app = app
+        self.path = path
+        self.authorization = b"Bearer " + owner_token.encode("ascii")
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # Clients on the existing private MCP URL can continue connecting without a header.
+        if scope["type"] == "http" and scope["path"] == self.path and "authorization" not in Headers(scope=scope):
+            scope = {**scope, "headers": [*scope["headers"], (b"authorization", self.authorization)]}
+        await self.app(scope, receive, send)
+
+
+def active_account() -> str | None:
+    access = get_access_token()
+    return access.client_id if access and access.client_id != OWNER_CLIENT else None
 
 
 def installer_script(agent: str, endpoint: str, name: str, idle_delay: float = 0.1) -> str:
@@ -155,29 +165,25 @@ class Bridge:
         self.public_url = public_url
         self.url = public_url or f"http://{HOST}:{port}"
         self.mcp_path = "/mcp" if public_url else mcp_path(key)
-        self.computers: dict[str, Computer] = {}
+        self.computers: dict[str | None, dict[str, Computer]] = {}
         self.agent = (ROOT / "oc-mcp.lua").read_text(encoding="utf-8")
 
-    def credential(self, purpose: str, name: str) -> str:
-        if self.public_url:
-            return public_agent_token(self.key, self.public_url, purpose, name)
-        return token(self.key, f"{purpose}/{name}")
-
     def install_command(self, name: str) -> str:
-        url = f"{self.url}/i/{name}/{self.credential('install', name)}"
-        return installer_command(url)
+        return installer_command(self.url + agent_path(self.key, self.public_url, "install", name))
 
     async def install(self, request: Request) -> Response:
         name = request.path_params["name"]
-        if not NAME.fullmatch(name) or not valid_token(request.path_params["token"], self.credential("install", name)):
+        account = request.path_params.get("account")
+        if not valid_agent_request(self.key, self.public_url, "install", name, account, request.path_params["token"]):
             return PlainTextResponse("Installer not found", status_code=404)
-        endpoint = f"{self.url}/a/{name}/{self.credential('agent', name)}"
+        endpoint = self.url + agent_path(self.key, self.public_url, "agent", name, account)
         idle_delay = 2 if self.public_url else 0.1
         return PlainTextResponse(installer_script(self.agent, endpoint, name, idle_delay), headers={"Cache-Control": "no-store"})
 
     async def poll(self, request: Request) -> Response:
         name = request.path_params["name"]
-        if not NAME.fullmatch(name) or not valid_token(request.path_params["token"], self.credential("agent", name)):
+        account = request.path_params.get("account")
+        if not valid_agent_request(self.key, self.public_url, "agent", name, account, request.path_params["token"]):
             return PlainTextResponse("Unknown agent", status_code=404)
         frame = bytearray()
         async for chunk in request.stream():
@@ -189,9 +195,10 @@ class Bridge:
             return PlainTextResponse("Invalid frame", status_code=400)
 
         computer_id = address.decode("ascii")
-        computer = self.computers.get(computer_id)
+        computers = self.computers.setdefault(account, {})
+        computer = computers.get(computer_id)
         if computer is None:
-            computer = self.computers[computer_id] = Computer(computer_id, name, time.monotonic())
+            computer = computers[computer_id] = Computer(computer_id, name, time.monotonic())
         computer.last_seen = time.monotonic()
         computer.name = name
         job = computer.job
@@ -216,11 +223,12 @@ class Bridge:
             return PlainTextResponse(job.frame, headers={"Cache-Control": "no-store"})
         return PlainTextResponse("idle", headers={"Cache-Control": "no-store"})
 
-    def resolve(self, target: str) -> Computer:
+    def resolve(self, target: str, account: str | None) -> Computer:
         target = target.strip().lower()
-        computer = self.computers.get(target)
+        computers = self.computers.get(account, {})
+        computer = computers.get(target)
         if computer is None:
-            matches = [item for item in self.computers.values() if item.name == target]
+            matches = [item for item in computers.values() if item.name == target]
             if len(matches) > 1:
                 ids = ", ".join(item.id for item in matches)
                 raise ValueError(f"Several computers are named {target!r}. Use a full ID: {ids}")
@@ -231,8 +239,8 @@ class Bridge:
             raise ValueError(f"{computer.name} ({computer.id}) is offline. Check the computer, chunk and bridge.")
         return computer
 
-    async def call(self, target: str, operation: str, *args: str | bytes, timeout: int = 12) -> tuple[dict, list[bytes]]:
-        computer = self.resolve(target)
+    async def call(self, target: str, operation: str, *args: str | bytes, account: str | None, timeout: int = 12) -> tuple[dict, list[bytes]]:
+        computer = self.resolve(target, account)
         if computer.job is not None:
             raise ValueError(f"{computer.name} is busy. Try again after it finishes or polls again.")
         job_id = secrets.token_hex(8)
@@ -254,15 +262,12 @@ class Bridge:
 
 def create_app(bridge: Bridge):
     allowed_hosts = [f"{HOST}:*"]
-    auth = None
-    token_verifier = None
     if bridge.public_url:
         origin = urlsplit(bridge.public_url)
         allowed_hosts = [origin.netloc.lower()]
         if origin.port in (None, 443) and origin.hostname:
             allowed_hosts = [origin.hostname, f"{origin.hostname}:443"]
-        auth = AuthSettings(issuer_url=AnyHttpUrl(bridge.public_url), resource_server_url=None)
-        token_verifier = McpTokenVerifier(bridge.key)
+    token_verifier = McpTokenVerifier(bridge.key)
 
     mcp = FastMCP(
         "OpenComputers",
@@ -272,7 +277,7 @@ def create_app(bridge: Bridge):
         streamable_http_path=bridge.mcp_path,
         stateless_http=True,
         json_response=True,
-        auth=auth,
+        auth=AuthSettings(issuer_url=AnyHttpUrl(bridge.url), resource_server_url=None),
         token_verifier=token_verifier,
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
@@ -282,6 +287,12 @@ def create_app(bridge: Bridge):
     )
     mcp.custom_route("/i/{name}/{token}", ["GET"])(bridge.install)
     mcp.custom_route("/a/{name}/{token}", ["POST"])(bridge.poll)
+    mcp.custom_route("/u/{account}/a/{name}/{token}", ["POST"])(bridge.poll)
+    if bridge.public_url:
+        setup = SetupPage(bridge.key, lambda: bridge.public_url)
+        mcp.custom_route("/", ["GET"])(setup.handle)
+        mcp.custom_route("/setup", ["GET", "POST"])(setup.handle)
+        mcp.custom_route("/u/{account}/i/{name}/{token}", ["GET"])(bridge.install)
 
     @mcp.custom_route("/healthz", ["GET"])
     async def health(_request: Request) -> Response:
@@ -290,7 +301,8 @@ def create_app(bridge: Bridge):
     @mcp.tool()
     async def list_computers() -> list[dict[str, Any]]:
         """List connected and recently seen in-game computers with names, stable IDs and online/busy state."""
-        return [computer.describe() for computer in sorted(bridge.computers.values(), key=lambda item: (item.name, item.id))]
+        computers = bridge.computers.get(active_account(), {})
+        return [computer.describe() for computer in sorted(computers.values(), key=lambda item: (item.name, item.id))]
 
     @mcp.tool()
     async def run_command(
@@ -299,14 +311,16 @@ def create_app(bridge: Bridge):
         timeout_seconds: Annotated[int, Field(ge=1, le=40)] = 10,
     ) -> dict[str, Any]:
         """Run a command using the selected computer's OpenOS shell. Capture stdout, stderr and exit code. Use stdin for non-interactive input."""
-        computer, (kind, code, stdout, stderr, truncated) = await bridge.call(target, "exec", command, cwd, stdin, timeout=timeout_seconds)
+        computer, (kind, code, stdout, stderr, truncated) = await bridge.call(
+            target, "exec", command, cwd, stdin, account=active_account(), timeout=timeout_seconds,
+        )
         return {"computer": computer, "exit_code": int(code) if code else None, "timed_out": kind == b"timeout",
                 "stdout": as_text(stdout), "stderr": as_text(stderr), "truncated": flag(truncated)}
 
     @mcp.tool()
     async def list_files(target: str, path: FilePath = "/home", offset: Annotated[int, Field(ge=0)] = 0) -> dict[str, Any]:
         """List up to 100 entries on the selected OpenOS computer. Directories end in /. Pass next_offset to continue."""
-        computer, (path_value, more, *entries) = await bridge.call(target, "list", path, str(offset))
+        computer, (path_value, more, *entries) = await bridge.call(target, "list", path, str(offset), account=active_account())
         return {"computer": computer, "path": as_text(path_value), "entries": [as_text(entry) for entry in entries],
                 "next_offset": offset + len(entries) if flag(more) else None}
 
@@ -316,7 +330,7 @@ def create_app(bridge: Bridge):
         limit: Annotated[int, Field(ge=1, le=FILE_LIMIT)] = 8192, encoding: Literal["utf-8", "base64"] = "utf-8",
     ) -> dict[str, Any]:
         """Read a byte range from an OpenOS file. Use base64 for binary files and for exact byte ranges."""
-        computer, (path_value, data, eof) = await bridge.call(target, "read", path, str(offset), str(limit))
+        computer, (path_value, data, eof) = await bridge.call(target, "read", path, str(offset), str(limit), account=active_account())
         if encoding == "utf-8":
             try:
                 content = data.decode("utf-8")
@@ -339,7 +353,7 @@ def create_app(bridge: Bridge):
             raise ValueError("Invalid file content for the selected encoding") from error
         if len(data) > FILE_LIMIT:
             raise ValueError("File content exceeds 16 KiB. Split it into chunks.")
-        computer, (path_value,) = await bridge.call(target, "write", path, mode, data)
+        computer, (path_value,) = await bridge.call(target, "write", path, mode, data, account=active_account())
         return {"computer": computer, "path": as_text(path_value), "bytes_written": len(data), "mode": mode}
 
     @mcp.tool()
@@ -348,7 +362,7 @@ def create_app(bridge: Bridge):
         rows: Annotated[int, Field(ge=1, le=50)] = 50,
     ) -> dict[str, Any]:
         """Read character cells from the selected computer's primary GPU screen, including text drawn by apps. Row numbers start at 1."""
-        computer, (width, height, text) = await bridge.call(target, "screen", str(row), str(rows), timeout=25)
+        computer, (width, height, text) = await bridge.call(target, "screen", str(row), str(rows), account=active_account(), timeout=25)
         return {"computer": computer, "width": int(width), "height": int(height), "first_row": row, "text": as_text(text)}
 
     @mcp.tool()
@@ -356,10 +370,13 @@ def create_app(bridge: Bridge):
         """Paste text and/or press a key on the selected computer's foreground OpenOS terminal. With both, paste first, then press the key."""
         if not text and key is None:
             raise ValueError("Provide text or a key")
-        computer, _ = await bridge.call(target, "input", text, key or "")
+        computer, _ = await bridge.call(target, "input", text, key or "", account=active_account())
         return {"computer": computer, "input_sent": True}
 
-    return mcp.streamable_http_app()
+    app = mcp.streamable_http_app()
+    if not bridge.public_url:
+        app.add_middleware(LocalMcpAuth, path=bridge.mcp_path, owner_token=token_verifier.expected)
+    return app
 
 
 def main() -> None:

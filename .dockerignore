@@ -2,4 +2,7 @@
 !requirements.txt
 !bridge.py
 !relay.py
+!credentials.py
+!setup_web.py
+!setup.html
 !oc-mcp.lua

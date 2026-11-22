@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Подключение OpenComputers</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f2f6f5; color: #172d29; font: 1rem/1.55 system-ui, sans-serif; }
+    main { max-width: 50rem; margin: 0 auto; padding: clamp(1rem, 4vw, 2.5rem); }
+    header { border-bottom: 2px solid #286c56; margin-bottom: 1.25rem; padding-bottom: 1.25rem; }
+    h1, h2, h3 { line-height: 1.2; margin: 0; }
+    h1 { font-size: clamp(1.8rem, 6vw, 2.65rem); letter-spacing: -.035em; }
+    h2 { font-size: 1.28rem; }
+    h3 { font-size: 1rem; }
+    p { margin: .65rem 0; }
+    code { font: .9em ui-monospace, Consolas, monospace; }
+    header code { display: block; margin-top: .4rem; color: #41635a; overflow-wrap: anywhere; }
+    section { background: #fff; border: 1px solid #cbdcd6; border-radius: .7rem; padding: clamp(1rem, 3vw, 1.5rem); }
+    section + section { margin-top: 1rem; }
+    form { margin: .85rem 0; }
+    .setup-form { display: grid; gap: .65rem; grid-template-columns: 1.3fr 1fr; align-items: end; }
+    label { display: grid; gap: .25rem; font-size: .9rem; font-weight: 600; }
+    input { width: 100%; padding: .55rem .7rem; border: 1px solid #78958b; border-radius: .35rem; font: inherit; color: inherit; }
+    button { padding: .55rem .75rem; border: 1px solid #78958b; border-radius: .35rem; background: #fff; color: inherit; font: 600 .88rem/1.3 system-ui, sans-serif; cursor: pointer; }
+    button:not(.primary):hover { background: #e1efe9; }
+    .primary { justify-self: start; background: #17634b; color: #fff; border-color: #17634b; }
+    .primary:hover { background: #124c3a; }
+    :focus-visible { outline: 2px solid #1b7664; outline-offset: 3px; }
+    .command { margin: .55rem 0 .85rem; border: 1px solid #ccddd7; border-radius: .45rem; background: #f3f8f6; }
+    pre { margin: 0; padding: .65rem .75rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .command button { margin: 0 .75rem .55rem; }
+    details { border-top: 1px solid #dce8e3; margin-top: .6rem; padding-top: .55rem; }
+    summary { cursor: pointer; font-weight: 600; }
+    .error { border-left: .25rem solid #a33827; background: #fff1ed; padding: .65rem .85rem; color: #77281c; }
+    @media (max-width: 34rem) { .setup-form { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Подключение OpenComputers</h1>
+      <code>$origin</code>
+    </header>
+    $content
+  </main>
+  <script nonce="$nonce">
+    if (navigator.clipboard) {
+      for (const button of document.querySelectorAll("[data-copy]")) {
+        button.hidden = false;
+        button.addEventListener("click", async () => {
+          const code = document.getElementById(button.dataset.copy);
+          try {
+            await navigator.clipboard.writeText(code.textContent);
+            button.textContent = "Скопировано";
+          } catch {
+            const range = document.createRange();
+            range.selectNodeContents(code);
+            const selection = window.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+            button.textContent = "Текст выделен";
+          }
+        });
+      }
+    }
+  </script>
+</body>
+</html>

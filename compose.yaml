@@ -3,8 +3,17 @@ name: oc-mcp
 services:
   bridge:
     image: ${OC_MCP_IMAGE:-ghcr.io/zizazar/oc-mcp:latest}
+    environment:
+      OC_MCP_PUBLIC_URL: "${OC_MCP_DOMAIN:+https://${OC_MCP_DOMAIN:-}}"
     labels:
-      traefik.enable: "false"
+      traefik.enable: "${TRAEFIK_ENABLE:-false}"
+      traefik.docker.network: "${TRAEFIK_NETWORK:-oc-mcp_default}"
+      traefik.http.routers.oc-mcp.rule: "Host(`${OC_MCP_DOMAIN:-}`)"
+      traefik.http.routers.oc-mcp.entrypoints: "${TRAEFIK_HTTPS_ENTRYPOINT:-websecure}"
+      traefik.http.routers.oc-mcp.tls: "true"
+      traefik.http.routers.oc-mcp.tls.certresolver: "${TRAEFIK_CERTRESOLVER:-}"
+      traefik.http.routers.oc-mcp.service: "oc-mcp"
+      traefik.http.services.oc-mcp.loadbalancer.server.port: "8765"
     ports:
       - "127.0.0.1:8765:8765"
     restart: unless-stopped
@@ -16,36 +25,10 @@ services:
       timeout: 3s
       retries: 5
 
-  relay:
-    profiles: [https]
-    image: ${OC_MCP_IMAGE:-ghcr.io/zizazar/oc-mcp:latest}
-    command: ["python", "relay.py", "serve", "--host", "0.0.0.0", "--bridge-host", "bridge", "--public-url", "https://${OC_MCP_DOMAIN:-oc.example.com}", "--expose-mcp"]
-    networks: [default, proxy]
-    labels:
-      traefik.enable: "true"
-      traefik.docker.network: "${TRAEFIK_NETWORK:-traefik}"
-      traefik.http.routers.oc-mcp.rule: "Host(`${OC_MCP_DOMAIN:-oc.example.com}`)"
-      traefik.http.routers.oc-mcp.entrypoints: "${TRAEFIK_HTTPS_ENTRYPOINT:-websecure}"
-      traefik.http.routers.oc-mcp.tls: "true"
-      traefik.http.routers.oc-mcp.tls.certresolver: "${TRAEFIK_CERTRESOLVER:-}"
-      traefik.http.routers.oc-mcp.service: "oc-mcp"
-      traefik.http.services.oc-mcp.loadbalancer.server.port: "8766"
-    depends_on:
-      bridge:
-        condition: service_healthy
-    restart: unless-stopped
-    volumes:
-      - state:/var/lib/oc-mcp:ro
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/', timeout=2).close()"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
 networks:
-  proxy:
-    name: ${TRAEFIK_NETWORK:-traefik}
-    external: true
+  default:
+    name: ${TRAEFIK_NETWORK:-oc-mcp_default}
+    external: ${TRAEFIK_ENABLE:-false}
 
 volumes:
   state:

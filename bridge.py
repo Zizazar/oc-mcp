@@ -1,4 +1,4 @@
-"""Local MCP server and OpenComputers HTTP bridge."""
+"""MCP server and OpenComputers HTTP bridge for local and HTTPS setups."""
 
 import argparse
 import asyncio
@@ -12,12 +12,14 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Literal
-from urllib.parse import quote_from_bytes, unquote_to_bytes
+from urllib.parse import quote_from_bytes, unquote_to_bytes, urlsplit
 
 import uvicorn
+from mcp.server.auth.provider import AccessToken
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import Field
+from pydantic import AnyHttpUrl, Field
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
 
@@ -80,8 +82,36 @@ def mcp_path(key: bytes) -> str:
     return f"/mcp/{token(key, 'mcp', 64)}"
 
 
+def mcp_bearer_token(key: bytes) -> str:
+    return token(key, "mcp/bearer", 64)
+
+
+def public_agent_token(key: bytes, url: str, purpose: str, name: str) -> str:
+    # Keep existing relay installer and agent URLs usable on the same domain.
+    return token(key, f"relay/{url}/{purpose}/{name}")
+
+
+def https_origin(value: str) -> str:
+    value = value.strip().rstrip("/")
+    if not re.fullmatch(r"https://[a-z0-9.-]+(?::[0-9]{1,5})?", value, re.IGNORECASE):
+        raise ValueError("use an HTTPS origin, such as https://oc.example.com")
+    if urlsplit(value).port == 0:
+        raise ValueError("the HTTPS origin cannot use port 0")
+    return value
+
+
 def valid_token(value: str, expected: str) -> bool:
     return value.isascii() and hmac.compare_digest(value, expected)
+
+
+class McpTokenVerifier:
+    def __init__(self, key: bytes):
+        self.expected = mcp_bearer_token(key)
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if valid_token(token.lstrip(" "), self.expected):
+            return AccessToken(token=self.expected, client_id="oc-mcp", scopes=[])
+        return None
 
 
 def installer_command(url: str) -> str:
@@ -120,27 +150,34 @@ class Computer:
 
 
 class Bridge:
-    def __init__(self, key: bytes, port: int):
+    def __init__(self, key: bytes, port: int, public_url: str | None = None):
         self.key = key
-        self.url = f"http://{HOST}:{port}"
-        self.mcp_path = mcp_path(key)
+        self.public_url = public_url
+        self.url = public_url or f"http://{HOST}:{port}"
+        self.mcp_path = "/mcp" if public_url else mcp_path(key)
         self.computers: dict[str, Computer] = {}
         self.agent = (ROOT / "oc-mcp.lua").read_text(encoding="utf-8")
 
+    def credential(self, purpose: str, name: str) -> str:
+        if self.public_url:
+            return public_agent_token(self.key, self.public_url, purpose, name)
+        return token(self.key, f"{purpose}/{name}")
+
     def install_command(self, name: str) -> str:
-        url = f"{self.url}/i/{name}/{token(self.key, 'install/' + name)}"
+        url = f"{self.url}/i/{name}/{self.credential('install', name)}"
         return installer_command(url)
 
     async def install(self, request: Request) -> Response:
         name = request.path_params["name"]
-        if not NAME.fullmatch(name) or not valid_token(request.path_params["token"], token(self.key, "install/" + name)):
+        if not NAME.fullmatch(name) or not valid_token(request.path_params["token"], self.credential("install", name)):
             return PlainTextResponse("Installer not found", status_code=404)
-        endpoint = f"{self.url}/a/{name}/{token(self.key, 'agent/' + name)}"
-        return PlainTextResponse(installer_script(self.agent, endpoint, name), headers={"Cache-Control": "no-store"})
+        endpoint = f"{self.url}/a/{name}/{self.credential('agent', name)}"
+        idle_delay = 2 if self.public_url else 0.1
+        return PlainTextResponse(installer_script(self.agent, endpoint, name, idle_delay), headers={"Cache-Control": "no-store"})
 
     async def poll(self, request: Request) -> Response:
         name = request.path_params["name"]
-        if not NAME.fullmatch(name) or not valid_token(request.path_params["token"], token(self.key, "agent/" + name)):
+        if not NAME.fullmatch(name) or not valid_token(request.path_params["token"], self.credential("agent", name)):
             return PlainTextResponse("Unknown agent", status_code=404)
         frame = bytearray()
         async for chunk in request.stream():
@@ -176,8 +213,8 @@ class Bridge:
         job = computer.job
         if job and not job.sent:
             job.sent = True
-            return Response(job.frame, media_type="text/plain")
-        return Response(b"idle", media_type="text/plain")
+            return PlainTextResponse(job.frame, headers={"Cache-Control": "no-store"})
+        return PlainTextResponse("idle", headers={"Cache-Control": "no-store"})
 
     def resolve(self, target: str) -> Computer:
         target = target.strip().lower()
@@ -216,6 +253,17 @@ class Bridge:
 
 
 def create_app(bridge: Bridge):
+    allowed_hosts = [f"{HOST}:*"]
+    auth = None
+    token_verifier = None
+    if bridge.public_url:
+        origin = urlsplit(bridge.public_url)
+        allowed_hosts = [origin.netloc.lower()]
+        if origin.port in (None, 443) and origin.hostname:
+            allowed_hosts = [origin.hostname, f"{origin.hostname}:443"]
+        auth = AuthSettings(issuer_url=AnyHttpUrl(bridge.public_url), resource_server_url=None)
+        token_verifier = McpTokenVerifier(bridge.key)
+
     mcp = FastMCP(
         "OpenComputers",
         instructions=("Control installed OpenComputers PCs in the local Minecraft world. Start with list_computers. "
@@ -224,9 +272,11 @@ def create_app(bridge: Bridge):
         streamable_http_path=bridge.mcp_path,
         stateless_http=True,
         json_response=True,
+        auth=auth,
+        token_verifier=token_verifier,
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
-            allowed_hosts=["127.0.0.1:*"],
+            allowed_hosts=allowed_hosts,
             allowed_origins=[],
         ),
     )
@@ -315,10 +365,13 @@ def create_app(bridge: Bridge):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--public-url", default=os.environ.get("OC_MCP_PUBLIC_URL"),
+                        help="public HTTPS origin behind a reverse proxy (or set OC_MCP_PUBLIC_URL)")
     subparsers = parser.add_subparsers(dest="action", required=True)
     serve = subparsers.add_parser("serve", help="start the bridge")
     serve.add_argument("--host", default=HOST, help="address to bind (default 127.0.0.1)")
-    subparsers.add_parser("mcp-url", help="print the private MCP endpoint for Codex")
+    subparsers.add_parser("mcp-url", help="print the MCP endpoint for Codex")
+    subparsers.add_parser("mcp-token", help="print the bearer token for the public MCP endpoint")
     install = subparsers.add_parser("install", help="print the one-line installer for an OpenOS computer")
     install.add_argument("name", help="starts with a-z, then a-z, digits, underscores or hyphens, up to 24 characters")
     args = parser.parse_args()
@@ -326,7 +379,14 @@ def main() -> None:
         parser.error("--port must be between 1 and 65535")
     if args.action == "install" and not NAME.fullmatch(args.name):
         parser.error("use a name like main or reactor-2 (a-z, 0-9, _, -, up to 24 characters)")
-    bridge = Bridge(access_key(), args.port)
+    try:
+        public_url = https_origin(args.public_url) if args.public_url else None
+    except ValueError as error:
+        parser.error(str(error))
+    if args.action == "mcp-token":
+        print(mcp_bearer_token(access_key()))
+        return
+    bridge = Bridge(access_key(), args.port, public_url)
     if args.action == "mcp-url":
         print(bridge.url + bridge.mcp_path)
     elif args.action == "install":

@@ -8,7 +8,6 @@ import re
 import shutil
 import socket
 import subprocess
-from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
@@ -17,26 +16,16 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Route
 
-from bridge import FRAME_LIMIT, HOST, NAME, ROOT, access_key, installer_command, installer_script, mcp_path, token, valid_token
+from bridge import (
+    FRAME_LIMIT, HOST, NAME, ROOT, access_key, https_origin, installer_command, installer_script,
+    mcp_bearer_token, mcp_path, public_agent_token, token, valid_token,
+)
 
 
 QUICK_URL = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 RELAY_STATUS = "OpenComputers relay\n"
 MCP_REQUEST_HEADERS = ("accept", "content-type", "mcp-protocol-version", "mcp-session-id", "last-event-id", "origin")
 MCP_RESPONSE_HEADERS = ("allow", "content-type", "mcp-session-id")
-
-
-def https_origin(value: str) -> str:
-    value = value.strip().rstrip("/")
-    if not re.fullmatch(r"https://[a-z0-9.-]+(?::[0-9]{1,5})?", value, re.IGNORECASE):
-        raise ValueError("use an HTTPS origin, such as https://relay.example.com")
-    if urlsplit(value).port == 0:
-        raise ValueError("the HTTPS origin cannot use port 0")
-    return value
-
-
-def mcp_bearer_token(key: bytes) -> str:
-    return token(key, "mcp/bearer", 64)
 
 
 class Relay:
@@ -48,7 +37,7 @@ class Relay:
         self.agent = (ROOT / "oc-mcp.lua").read_text(encoding="utf-8")
 
     def credential(self, url: str, purpose: str, name: str) -> str:
-        return token(self.key, f"relay/{url}/{purpose}/{name}")
+        return public_agent_token(self.key, url, purpose, name)
 
     def command(self, url: str, name: str) -> str:
         return installer_command(f"{url}/i/{name}/{self.credential(url, 'install', name)}")

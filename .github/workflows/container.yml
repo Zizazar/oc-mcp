@@ -21,6 +21,7 @@ jobs:
     env:
       OC_MCP_IMAGE: oc-mcp:ci
       OC_MCP_DOMAIN: localhost
+      TRAEFIK_ENABLE: 'true'
       TRAEFIK_NETWORK: oc-mcp-ci-proxy
     steps:
       - uses: actions/checkout@v6
@@ -41,36 +42,53 @@ jobs:
             traefik:v3 --providers.docker --providers.docker.exposedbydefault=false \
             --entrypoints.websecure.address=:443
 
-      - name: Check bridge, relay and HTTPS
+      - name: Check local bridge and direct HTTPS
         run: |
-          docker compose --profile https up --detach --wait --wait-timeout 60
-          curl --fail --silent --show-error --retry 5 --retry-all-errors --insecure https://localhost/ >/dev/null
-          mcp_url=$(docker compose exec -T bridge python bridge.py mcp-url)
-          public_mcp_url=https://localhost/mcp
-          mcp_token=$(docker compose --profile https exec -T relay python relay.py mcp-token)
-          echo "::add-mask::$mcp_token"
+          local_compose() {
+            TRAEFIK_ENABLE=false TRAEFIK_NETWORK= OC_MCP_DOMAIN= docker compose "$@"
+          }
           initialize='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"container-check","version":"1"}}}'
           headers=(-H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream')
+
+          local_compose up --detach --wait --wait-timeout 60
+          mcp_url=$(local_compose exec -T bridge python bridge.py mcp-url)
+          legacy_token=$(local_compose exec -T bridge python relay.py mcp-token)
+          echo "::add-mask::$legacy_token"
+          legacy_installer=$(local_compose exec -T bridge python -c 'from relay import Relay, access_key; print(Relay(access_key(), 8765).command("https://localhost", "container-check"))')
           curl --fail --silent --show-error "$mcp_url" "${headers[@]}" --data "$initialize" \
             | jq -e '.result.serverInfo.name == "OpenComputers"'
+          local_compose down
+
+          docker compose up --detach --wait --wait-timeout 60 --remove-orphans
+          test "$(docker compose ps --services)" = bridge
+          curl --fail --silent --show-error --retry 5 --retry-all-errors --insecure https://localhost/healthz >/dev/null
+          public_mcp_url=$(docker compose exec -T bridge python bridge.py mcp-url)
+          test "$public_mcp_url" = https://localhost/mcp
+          mcp_token=$(docker compose exec -T bridge python bridge.py mcp-token)
+          test "$mcp_token" = "$legacy_token"
           test "$(curl --silent --show-error --insecure -o /dev/null -w '%{http_code}' "$public_mcp_url" "${headers[@]}" --data "$initialize")" = 401
           test "$(curl --silent --show-error --insecure -o /dev/null -w '%{http_code}' "$public_mcp_url" "${headers[@]}" --data "$initialize" -H 'Authorization: Bearer invalid')" = 401
           curl --fail --silent --show-error --insecure "$public_mcp_url" "${headers[@]}" --data "$initialize" \
             -H "Authorization: Bearer $mcp_token" \
             | jq -e '.result.serverInfo.name == "OpenComputers"'
-          installer=$(docker compose exec -T relay python relay.py install container-check)
+          installer=$(docker compose exec -T bridge python bridge.py install container-check)
+          test "$installer" = "$legacy_installer"
           read -r _ _ installer_url _ <<< "$installer"
           agent_url=$(curl --fail --silent --show-error --insecure "$installer_url" | sed -n '1s/^local endpoint, computerName, idleDelay = "\([^"]*\)".*/\1/p')
           test "$(curl --fail --silent --show-error --insecure "$agent_url" --data '00000000-0000-0000-0000-000000000001')" = idle
+          list_computers='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_computers","arguments":{}}}'
+          curl --fail --silent --show-error --insecure "$public_mcp_url" "${headers[@]}" --data "$list_computers" \
+            -H "Authorization: Bearer $mcp_token" \
+            | jq -e '.result.structuredContent.result | any(.name == "container-check" and .online)'
           test "$(curl --silent --show-error --insecure -o /dev/null -w '%{http_code}' "https://localhost/mcp/${mcp_url##*/}")" = 404
-          docker compose --profile https up --detach --wait --wait-timeout 60 --force-recreate
-          test "$(docker compose exec -T bridge python bridge.py mcp-url)" = "$mcp_url"
-          test "$(docker compose --profile https exec -T relay python relay.py mcp-token)" = "$mcp_token"
+          docker compose up --detach --wait --wait-timeout 60 --force-recreate
+          test "$(docker compose exec -T bridge python bridge.py mcp-token)" = "$mcp_token"
 
       - name: Stop smoke test containers
         if: always()
         run: |
-          docker compose --profile https down --volumes
+          TRAEFIK_ENABLE=false TRAEFIK_NETWORK= OC_MCP_DOMAIN= docker compose down --volumes
+          docker compose down --volumes
           docker rm -f oc-mcp-ci-traefik || true
           docker network rm "$TRAEFIK_NETWORK" || true
 

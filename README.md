@@ -6,14 +6,14 @@
 
 GitHub Actions проверяет и публикует образ `ghcr.io/zizazar/oc-mcp:latest` для Linux x86-64 после каждого обновления `main`. Сервер скачивает готовый образ. Ключ моста хранится в томе `oc-mcp_state`, поэтому адреса подключения сохраняются при обновлениях и перезапусках.
 
-На VPS достаточно одного `compose.yaml`. Направьте DNS-запись поддомена на сервер с Traefik. Traefik должен использовать Docker provider и быть подключён к сети, указанной в `TRAEFIK_NETWORK`. [Traefik Docker provider](https://doc.traefik.io/traefik/providers/docker/)
+На VPS `compose.yaml` запускает один контейнер `bridge`. Traefik принимает HTTPS и направляет запросы прямо в мост. Направьте DNS-запись поддомена на сервер с Traefik. Traefik должен использовать Docker provider и быть подключён к сети, указанной в `TRAEFIK_NETWORK`. [Traefik Docker provider](https://doc.traefik.io/traefik/providers/docker/)
 
 ```bash
 curl -fsSLo compose.yaml https://raw.githubusercontent.com/Zizazar/oc-mcp/main/compose.yaml
-export OC_MCP_DOMAIN=oc.example.com TRAEFIK_NETWORK=traefik
+export OC_MCP_DOMAIN=oc.example.com TRAEFIK_ENABLE=true TRAEFIK_NETWORK=traefik
 export TRAEFIK_HTTPS_ENTRYPOINT=websecure TRAEFIK_CERTRESOLVER=letsencrypt
-docker compose --profile https up -d --pull always --wait
-docker compose --profile https exec -T relay python relay.py install server-main
+docker compose up -d --pull always --wait --remove-orphans
+docker compose exec -T bridge python bridge.py install server-main
 ```
 
 Подставьте имя своего HTTPS entrypoint и resolver для сертификатов. Если Traefik уже подбирает сертификат по домену, оставьте `TRAEFIK_CERTRESOLVER` пустым. Переменные можно сохранить в `.env` вместо `export`. Выполните выведенную команду в терминале игрового компьютера с OpenOS и Internet Card. Для каждого компьютера задайте своё имя.
@@ -21,7 +21,7 @@ docker compose --profile https exec -T relay python relay.py install server-main
 Codex подключается напрямую к `https://oc.example.com/mcp` с Bearer-токеном. На VPS получите токен для своего сервера. При обновлениях токен остаётся тем же, пока используется том `oc-mcp_state`.
 
 ```bash
-docker compose --profile https exec -T relay python relay.py mcp-token
+docker compose exec -T bridge python bridge.py mcp-token
 ```
 
 На компьютере с Codex подставьте свой домен, введите токен в PowerShell 7 и зарегистрируйте сервер. Перезапустите приложение Codex после настройки.
@@ -32,9 +32,11 @@ $env:OC_MCP_TOKEN = Read-Host 'MCP token' -MaskInput
 codex mcp add opencomputers --url https://oc.example.com/mcp --bearer-token-env-var OC_MCP_TOKEN
 ```
 
-Для обновления с теми же переменными запустите на VPS `docker compose --profile https up -d --pull always --wait`. Если в репозитории изменился `compose.yaml`, скачайте его заново. Сохраняйте том `oc-mcp_state` при резервном копировании и удалении контейнеров.
+Для обновления скачайте свежий `compose.yaml` и запустите `docker compose up -d --pull always --wait --remove-orphans`. При переходе со старой схемы добавьте `TRAEFIK_ENABLE=true` к своим переменным. `--remove-orphans` удалит старый контейнер `relay`. Если домен и том `oc-mcp_state` прежние, действующие подключения Codex и игровых компьютеров сохранятся.
 
-Для локального Docker без HTTPS запустите `docker compose up -d --pull always --wait` из той же папки. Адрес для Codex выдаёт `docker compose exec -T bridge python bridge.py mcp-url`, а команду установки для локального мира выдаёт `docker compose exec -T bridge python bridge.py install main`.
+При запуске на VPS без Docker задайте `OC_MCP_PUBLIC_URL=https://oc.example.com` для `python bridge.py serve` и команд `mcp-url`, `mcp-token` и `install`. Направьте HTTPS-прокси на `127.0.0.1:8765` с исходным заголовком `Host`.
+
+Для локального Docker без HTTPS запустите `docker compose up -d --pull always --wait` из папки без серверных переменных. Адрес для Codex выдаёт `docker compose exec -T bridge python bridge.py mcp-url`, а команду установки для локального мира выдаёт `docker compose exec -T bridge python bridge.py install main`.
 
 ## Запуск на Windows
 
